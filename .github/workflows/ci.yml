@@ -1,0 +1,144 @@
+name: Self-Healing Automation Dashboard CI
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  test-and-report:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout main branch
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Reset test results for this run
+        run: |
+          mkdir -p cypress/reports
+          echo '[]' > cypress/reports/healing-results.json
+          echo '{"totalTests":0,"totalPassed":0,"totalFailed":0,"totalPending":0,"totalSkipped":0,"totalDuration":0,"specs":[]}' > cypress/reports/test-results.json
+
+      - name: Run Self-Healing Tests
+        continue-on-error: true
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          CYPRESS_GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: npx cypress run --spec "cypress/e2e/cto-showcase.cy.js,cypress/e2e/e2e-showcase.cy.js"
+
+      - name: Upload Current Run Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: healing-results
+          path: cypress/reports/healing-results.json
+
+      - name: Ensure dashboard-data branch exists
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if ! git ls-remote --exit-code --heads origin dashboard-data; then
+            DEFAULT_SHA=$(git rev-parse HEAD)
+            gh api repos/${{ github.repository }}/git/refs \
+              -f ref="refs/heads/dashboard-data" \
+              -f sha="$DEFAULT_SHA" || true
+            gh api repos/${{ github.repository }}/contents/history.json \
+              -X PUT \
+              -f message="chore: initialize dashboard-data branch" \
+              -f content="$(echo '[]' | base64 -w0)" \
+              -f branch="dashboard-data" || true
+            gh api repos/${{ github.repository }}/contents/latest.json \
+              -X PUT \
+              -f message="chore: initialize dashboard-data branch" \
+              -f content="$(echo '{}' | base64 -w0)" \
+              -f branch="dashboard-data" || true
+          fi
+
+      - name: Checkout Dashboard Data Branch
+        uses: actions/checkout@v4
+        with:
+          ref: dashboard-data
+          path: data-branch
+
+      - name: Process Historical Data
+        run: |
+          cp cypress/reports/healing-results.json src/tools/ || true
+          cp cypress/reports/test-results.json src/tools/ || true
+          cp data-branch/history.json src/tools/ || true
+          # Strip BOM and ensure valid JSON fallback
+          node -e "
+            const fs = require('fs');
+            const f = 'src/tools/history.json';
+            try { const d = fs.readFileSync(f,'utf8').replace(/^\uFEFF/,''); JSON.parse(d); fs.writeFileSync(f,d); }
+            catch(e) { console.log('Resetting history.json to []'); fs.writeFileSync(f,'[]'); }
+          "
+          node src/tools/generate-historical-data.js
+          cp src/tools/history.json data-branch/
+          cp src/tools/latest.json data-branch/
+          mkdir -p data-branch/runs
+          cp src/tools/runs/* data-branch/runs/ || true
+
+      - name: Commit and Push History to Data Branch
+        run: |
+          cd data-branch
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add history.json latest.json runs/
+          git commit -m "chore: update history for run ${{ github.run_id }}" || echo "No changes to commit"
+          git push origin dashboard-data
+
+      - name: Prepare Dashboard Data
+        run: |
+          cp data-branch/history.json dashboard/
+          cp data-branch/latest.json dashboard/
+          mkdir -p dashboard/runs
+          cp data-branch/runs/* dashboard/runs/ || true
+
+      - name: Deploy Dashboard to GitHub Pages
+        uses: peaceiris/actions-gh-pages@v3
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./dashboard
+          publish_branch: gh-pages
+
+      - name: Generate CI Summary
+        run: |
+          node -e "
+            const fs = require('fs');
+            let results = [];
+            try {
+              const raw = fs.readFileSync('cypress/reports/healing-results.json', 'utf8').replace(/^\uFEFF/, '');
+              results = JSON.parse(raw);
+            } catch (e) {}
+            const selectorHeals = results.filter(r => r.success).length;
+            const failures      = results.filter(r => !r.success).length;
+            const summary = {
+              totalRuns:      results.length,
+              selectorHeals,
+              flowHeals:      0,
+              failures,
+              timeSavedHours: parseFloat((selectorHeals * 0.5).toFixed(2)),
+              healRate:       results.length > 0
+                ? parseFloat(((selectorHeals / results.length) * 100).toFixed(2))
+                : 0.0
+            };
+            fs.writeFileSync('ci-summary.json', JSON.stringify(summary, null, 2));
+            console.log('CI Summary:', JSON.stringify(summary));
+          "
+
+      - name: Upload CI Summary
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-summary
+          path: ci-summary.json
